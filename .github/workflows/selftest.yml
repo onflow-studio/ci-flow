@@ -1,0 +1,43 @@
+# End-to-end check of a ci-flow machine: run it by hand after `ci-flow apply`
+# with a slot labelled ci-flow-selftest for this repo (see docs/runners.md).
+# Pushing the ci-flow-selftest branch also runs it, for testing changes to the
+# engine before they reach the default branch.
+name: Self-test
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ci-flow-selftest]
+
+jobs:
+  isolation:
+    runs-on: [self-hosted, ci-flow-selftest]
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: selftest
+        # A fixed host port: with one dind daemon per slot it can't collide
+        # with the same port in another slot's job.
+        ports: ["5436:5432"]
+        # The runner waits for a healthy service before the steps start.
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s --health-timeout 5s --health-retries 30
+    steps:
+      - name: Runner
+        run: |
+          echo "runner: $RUNNER_NAME"
+          echo "docker: $DOCKER_HOST"
+          docker version --format 'server {{.Server.Version}}'
+      - name: Containers run in the slot's own daemon
+        run: docker run --rm hello-world
+      - name: The service's fixed port is on localhost
+        run: |
+          # --network host joins the slot's network namespace, where the runner
+          # lives too: that's what makes 127.0.0.1:5436 reach the service.
+          docker run --rm --network host postgres:16-alpine pg_isready -h 127.0.0.1 -p 5436
+      - name: The workspace starts empty
+        run: |
+          ls -A "$GITHUB_WORKSPACE"
+          test -z "$(ls -A "$GITHUB_WORKSPACE")"

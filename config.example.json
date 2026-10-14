@@ -1,0 +1,24 @@
+{
+  "repos": [
+    {
+      "repo": "acme/web",
+      "slots": 3,
+      "labels": ["acme"],
+      "memory": "4g",
+      "cpus": 4,
+      "slot": {
+        "1": {"labels": ["acme", "build"], "memory": "8g", "cpus": 8, "node_heap": 6144}
+      }
+    }
+  ],
+  "fleets": [
+    {
+      "project": "legacy-ci",
+      "unit": "legacy-ci-runner@{}.service",
+      "slots": {
+        "1": "acme/api",
+        "2": "acme/api"
+      }
+    }
+  ]
+}

@@ -1,0 +1,60 @@
+{
+  "version": 1,
+  "ts": 1791990000.0,
+  "hostname": "ci-box",
+  "fleets": [
+    {"project": "acme-ci", "unit": "acme-ci-runner@{}.service",
+     "slots": {"1": "acme/web", "2": "acme/web", "3": "acme/api"}}
+  ],
+  "repos": ["acme/web", "acme/api"],
+  "host": {
+    "cpu": 42.0,
+    "cpu_hist": [10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 50, 42],
+    "net": [1048576, 2048],
+    "mem": {"used": 8589934592, "total": 17179869184, "swap_used": 0, "swap_total": 0},
+    "disk": {"used": 100000000000, "total": 500000000000, "free": 400000000000},
+    "load": [2.0, 1.5, 1.0],
+    "ncpu": 8,
+    "temp": 60.0,
+    "ac": true,
+    "bat": 100,
+    "uptime": 90000
+  },
+  "docker_ok": true,
+  "units": {"acme-ci/1": "active", "acme-ci/2": "active", "acme-ci/3": "failed"},
+  "slots_up": ["acme-ci/1", "acme-ci/2"],
+  "runs": {
+    "acme/web": [
+      {"databaseId": 101, "workflowName": "CI", "displayTitle": "feat: add login page",
+       "headBranch": "dev/abc-12-login", "status": "queued", "conclusion": "",
+       "createdAt": "2026-10-14T13:00:00Z", "updatedAt": "2026-10-14T13:00:00Z", "event": "pull_request"},
+      {"databaseId": 102, "workflowName": "CI", "displayTitle": "fix: typo",
+       "headBranch": "dev/45-typo", "status": "queued", "conclusion": "",
+       "createdAt": "2026-10-14T13:05:00Z", "updatedAt": "2026-10-14T13:05:00Z", "event": "pull_request"},
+      {"databaseId": 100, "workflowName": "Deploy", "displayTitle": "release",
+       "headBranch": "main", "status": "completed", "conclusion": "failure",
+       "createdAt": "2026-10-14T12:00:00Z", "updatedAt": "2026-10-14T12:10:00Z", "event": "push"}
+    ],
+    "acme/api": [
+      {"databaseId": 200, "workflowName": "CI", "displayTitle": "chore: deps",
+       "headBranch": "main", "status": "completed", "conclusion": "success",
+       "createdAt": "2026-10-14T11:00:00Z", "updatedAt": "2026-10-14T11:05:00Z", "event": "push"}
+    ]
+  },
+  "jobs": {
+    "101": [
+      {"name": "Lint", "status": "completed", "conclusion": "success",
+       "started_at": "2026-10-14T13:01:00Z", "runner_name": "ci-box-1-1791980000", "steps": []},
+      {"name": "Unit Tests", "status": "in_progress", "conclusion": null,
+       "started_at": "2026-10-14T13:02:00Z", "runner_name": "ci-box-2-1791980001",
+       "steps": [{"status": "completed"}, {"status": "in_progress"}, {"status": "pending"}]},
+      {"name": "Build", "status": "queued", "conclusion": null,
+       "started_at": null, "runner_name": "", "steps": []}
+    ],
+    "102": [
+      {"name": "Lint", "status": "queued", "conclusion": null,
+       "started_at": null, "runner_name": "", "steps": []}
+    ]
+  },
+  "gh_err": {}
+}

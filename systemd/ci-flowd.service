@@ -1,0 +1,16 @@
+# Template for the ci-flowd user unit. `ci-flow install` fills in @CIFLOWD@ and
+# @PATH@ and writes the result to ~/.config/systemd/user/ci-flowd.service.
+[Unit]
+Description=ci-flow collector (CI machine snapshot on 127.0.0.1)
+After=network-online.target
+
+[Service]
+# GH_TOKEN for gh when the keyring is unreadable from a headless session.
+EnvironmentFile=-%h/.config/ci-flow/env
+Environment=PATH=@PATH@
+ExecStart=@CIFLOWD@
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
