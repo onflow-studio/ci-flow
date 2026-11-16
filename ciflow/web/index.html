@@ -237,10 +237,10 @@ function h(tag, attrs, ...kids) {
   return el;
 }
 
-// Turn an element into a link to a GitHub https URL, keeping its class and
+// Turn an element into a link to an https URL (GitHub or GitLab), keeping its class and
 // title so it stays the same grid or flex item; anything else stays as is.
 function link(url, el) {
-  if (typeof url !== "string" || !url.startsWith("https://github.com/")) return el;
+  if (typeof url !== "string" || !url.startsWith("https://")) return el;
   const a = h("a", { href: url, target: "_blank", rel: "noopener" });
   a.className = el.className;
   if (el.title) a.title = el.title;

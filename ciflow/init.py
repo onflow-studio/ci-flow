@@ -11,6 +11,7 @@ Steps, in order:
   services     the docker and tailscaled services, and the docker group
   tailscale    joined to a tailnet (interactive: printed, never run)
   gh-auth      gh logged in (interactive: printed, never run)
+  gitlab-token GITLAB_TOKEN in ~/.config/ci-flow/env, when a repo is on GitLab
   linger       user units keep running with nobody logged in
   install      ci-flow's code, the cimon/ci-flow links and the ci-flowd unit
   lid          laptops on external power keep running with the lid closed
@@ -26,7 +27,7 @@ import os
 import shutil
 import subprocess
 
-from . import config, engine, install, notify
+from . import config, engine, gitlab, install, notify
 
 LOGIND_DROPIN = "/etc/systemd/logind.conf.d/ci-flow.conf"
 LOGIND_CONF = ["/etc/systemd/logind.conf", "/usr/lib/systemd/logind.conf.d", "/etc/systemd/logind.conf.d"]
@@ -216,6 +217,15 @@ def step_gh_auth(m):
                                      "the repos' runners needs the repo scope (or Administration: write)"])
 
 
+def step_gitlab_token(conf):
+    if not any(e["forge"]["kind"] == "gitlab" for e in config.managed(conf)):
+        return None
+    ok = bool(gitlab.token())
+    return Step("gitlab-token", "a GitLab token is set for the GitLab repos", ok,
+                notes=[] if ok else [f"add GITLAB_TOKEN=<token> to {gitlab.ENV_FILE} (chmod 600); it needs the "
+                                     "create_runner and read_api scopes on the projects"])
+
+
 def step_linger(m):
     user = m.user()
     on = m.out(["loginctl", "show-user", user, "-p", "Linger", "--value"]).strip() == "yes"
@@ -364,9 +374,12 @@ def step_power():
         "'AC Back', 'Power On After Power Failure'); ci-flow can't set it for you"])
 
 
-def step_repos(conf, gh):
+def step_repos(conf, gh, gl=gitlab.GitLab):
     warns = []
     for e in config.managed(conf):
+        if e["forge"]["kind"] == "gitlab":
+            warns += gitlab.security_warnings(e["repo"], gl(e["forge"]["url"]).repo(e["repo"]))
+            continue
         info = gh.repo(e["repo"])
         fork = gh.fork_settings(e["repo"], not info.get("private")) if info else None
         warns += engine.security_warnings(e["repo"], info, fork)
@@ -383,22 +396,24 @@ def step_apply(conf, config_path):
                 [[os.path.join(install.source_root(), "ci-flow"), "--config", config_path, "apply"]])
 
 
-def plan(m, conf, gh, config_path, unit_dir, home=None, prune_days=PRUNE_DAYS, pm="detect"):
+def plan(m, conf, gh, config_path, unit_dir, home=None, prune_days=PRUNE_DAYS, pm="detect", gl=None):
     pm = distro() if pm == "detect" else pm
-    return [
+    steps = [
         step_packages(m, pm),
         step_services(m),
         step_tailscale(m),
         step_gh_auth(m),
+        step_gitlab_token(conf),
         step_linger(m),
         step_install(m, home),
         step_lid(m),
         step_prune(m, unit_dir, prune_days),
         step_alerts(conf),
         step_power(),
-        step_repos(conf, gh),
+        step_repos(conf, gh, gl or gitlab.GitLab),
         step_apply(conf, config_path),
     ]
+    return [s for s in steps if s is not None]
 
 
 def show(steps, out=print):

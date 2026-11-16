@@ -6,12 +6,16 @@
 - "fleets": runners set up some other way, which the dashboards only watch.
 
 Both become "fleets" for the collector: a compose project, a systemd unit
-template ({} is the slot number) and the repo each slot serves.
+template ({} is the slot number), the repo each slot serves and its forge.
+
+A repo's forge is GitHub unless it says "forge": "gitlab" (with "gitlab_url"
+for a self-managed instance; gitlab.com otherwise).
 """
 import json
 import os
 import re
 
+from . import gitlab
 from . import profile as profiles
 
 CONFIG = os.path.expanduser(os.environ.get("CIFLOW_CONFIG", "~/.config/ci-flow/config.json"))
@@ -20,10 +24,16 @@ BASE_LABELS = ["self-hosted", "linux", "x64"]
 
 # Limits and labels a repo sets for all its slots, and "slot" overrides per slot.
 SLOT_KEYS = {"labels", "memory", "cpus", "node_heap", "dind_memory", "dind_cpus"}
-REPO_KEYS = SLOT_KEYS | {"repo", "slots", "project", "slot", "profile"}
+REPO_KEYS = SLOT_KEYS | {"repo", "slots", "project", "slot", "profile", "forge", "gitlab_url", "image"}
+# GitLab jobs run in their own containers on the slot's Docker daemon, so the
+# runner image's profile, the Node heap and separate daemon limits don't apply:
+# "memory" and "cpus" bound the daemon, and "image" is the default job image.
+NOT_FOR_GITLAB = {"profile", "node_heap", "dind_memory", "dind_cpus"}
+FORGES = ("github", "gitlab")
 DEFAULTS = {"labels": [], "memory": "4g", "cpus": 4, "node_heap": None, "dind_memory": "2g", "dind_cpus": 2}
 
 REPO_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
+GITLAB_REPO_RE = re.compile(r"[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)+")  # groups nest
 LABEL_RE = re.compile(r"[A-Za-z0-9_.-]+")
 MEMORY_RE = re.compile(r"\d+(\.\d+)?[bkmgBKMG]?")
 # Always ciflow-*, so remove --purge can never reach a compose project ci-flow
@@ -56,6 +66,13 @@ def save(conf, path=CONFIG):
     os.replace(tmp, path)
 
 
+def forge_of(e):
+    """A repo entry's forge: {"kind": "github"} or {"kind": "gitlab", "url": ...}."""
+    if e.get("forge", "github") == "gitlab":
+        return {"kind": "gitlab", "url": (e.get("gitlab_url") or gitlab.DEFAULT_URL).rstrip("/")}
+    return {"kind": "github"}
+
+
 def project_of(repo):
     """'acme/web-app' -> 'ciflow-web-app'."""
     return "ciflow-" + re.sub(r"[^a-z0-9]+", "-", repo.split("/")[-1].lower()).strip("-")
@@ -79,18 +96,45 @@ def _check(where, key, value):
 def managed(conf):
     """The managed repos, validated and with every slot's settings resolved.
 
-    Returns [{"repo", "project", "profile", "slots": {n: {labels, memory, cpus,
-    node_heap, dind_memory, dind_cpus}}}]. node_heap is None when the config
-    leaves it to the repo's profile. "profile" is the inline profile, checked
+    Returns [{"repo", "project", "forge", "image", "profile", "slots": {n:
+    {labels, memory, cpus, node_heap, dind_memory, dind_cpus}}}]. "image" is
+    GitLab's default job image, None for GitHub. node_heap is None when the
+    config leaves it to the repo's profile. "profile" is the inline profile, checked
     by the same rules as .github/ci-flow.toml, or None when the repo's file
     (or the defaults) apply.
     """
     out, projects, repos = [], {}, set()
     for i, e in enumerate(conf.get("repos") or []):
         where = f"repos[{i}]"
-        if not isinstance(e, dict) or not isinstance(e.get("repo"), str) or not REPO_RE.fullmatch(e["repo"]):
-            raise ConfigError(f"{where}: \"repo\" must be \"owner/name\"")
+        if not isinstance(e, dict):
+            raise ConfigError(f"{where}: must be an object with \"repo\"")
+        kind = e.get("forge", "github")
+        if kind not in FORGES:
+            raise ConfigError(f"{where}: forge must be one of {', '.join(FORGES)}")
+        pattern = GITLAB_REPO_RE if kind == "gitlab" else REPO_RE
+        if not isinstance(e.get("repo"), str) or not pattern.fullmatch(e["repo"]):
+            raise ConfigError(f"{where}: \"repo\" must be "
+                              + ("\"group/project\"" if kind == "gitlab" else "\"owner/name\""))
         where = e["repo"]
+        if kind == "gitlab":
+            keys = set(e)
+            overrides = e.get("slot")
+            if isinstance(overrides, dict):
+                keys |= {k for o in overrides.values() if isinstance(o, dict) for k in o}
+            bad = sorted(keys & NOT_FOR_GITLAB)
+            if bad:
+                raise ConfigError(f"{where}: {', '.join(bad)} only apply to GitHub repos; GitLab jobs run "
+                                  "in their own images, bounded by memory and cpus")
+            url = e.get("gitlab_url")
+            if url is not None and (not isinstance(url, str) or not gitlab.URL_RE.fullmatch(url.rstrip("/"))):
+                raise ConfigError(f"{where}: gitlab_url must look like \"https://gitlab.example.com\"")
+            image = e.get("image", gitlab.DEFAULT_JOB_IMAGE)
+            if not isinstance(image, str) or not gitlab.IMAGE_RE.fullmatch(image):
+                raise ConfigError(f"{where}: image must be a Docker image like \"ubuntu:24.04\"")
+        else:
+            for k in ("gitlab_url", "image"):
+                if k in e:
+                    raise ConfigError(f"{where}: {k} only applies to GitLab repos (\"forge\": \"gitlab\")")
         if e["repo"].lower() in repos:
             raise ConfigError(f"{where}: listed twice; give it more slots instead")
         repos.add(e["repo"].lower())
@@ -128,17 +172,20 @@ def managed(conf):
             prof, problems = profiles.from_data(e["profile"], where=f"{where}: profile")
             if problems:
                 raise ConfigError("; ".join(problems))
-        out.append({"repo": e["repo"], "project": project, "profile": prof, "slots": slots})
+        out.append({"repo": e["repo"], "project": project, "forge": forge_of(e),
+                    "image": e.get("image", gitlab.DEFAULT_JOB_IMAGE) if kind == "gitlab" else None,
+                    "profile": prof, "slots": slots})
     return out
 
 
 def fleets(conf):
-    """Every fleet the dashboards watch: the watch-only ones, then the managed ones."""
+    """Every fleet the dashboards watch: the watch-only ones, then the managed
+    ones. A watch-only fleet may set "forge" and "gitlab_url" like a repo."""
     out = []
     for fl in conf.get("fleets") or []:
-        out.append({"project": fl["project"], "unit": fl["unit"],
+        out.append({"project": fl["project"], "unit": fl["unit"], "forge": forge_of(fl),
                     "slots": {int(n): repo for n, repo in fl["slots"].items()}})
     for m in managed(conf):
-        out.append({"project": m["project"], "unit": UNIT.format(project=m["project"]),
+        out.append({"project": m["project"], "unit": UNIT.format(project=m["project"]), "forge": m["forge"],
                     "slots": {n: m["repo"] for n in m["slots"]}})
     return out

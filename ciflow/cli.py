@@ -3,6 +3,7 @@
   ci-flow init [--yes]                                set up this machine (plan only without --yes)
   ci-flow install [--no-start]                        install this code, start the collector
   ci-flow add owner/repo --runners N [--labels a,b]   add a repo to the config
+      [--forge gitlab [--gitlab-url URL]]             (GitHub unless --forge gitlab)
   ci-flow remove owner/repo [--purge]                 stop its runners, drop it
   ci-flow apply [--dry-run]                           install, render, build and start
   ci-flow status                                      what runs where
@@ -18,7 +19,7 @@ import shutil
 import subprocess
 import sys
 
-from . import config, engine, install, loop
+from . import config, engine, gitlab, install, loop
 from . import init as machine_init
 
 UNIT_DIR = os.environ.get("CIFLOW_UNIT_DIR") or os.path.join(
@@ -106,8 +107,17 @@ def write_unit(system, path, text, out=say):
     return True
 
 
+def uses_github(path):
+    """Whether gh is needed: no config yet, or a GitHub repo in it."""
+    try:
+        conf = config.load(path)
+    except config.ConfigError:
+        return True
+    return any(e["forge"]["kind"] == "github" for e in config.managed(conf)) or not config.managed(conf)
+
+
 def cmd_install(args, system):
-    for tool in ("gh", "docker", "systemctl"):
+    for tool in ("gh", "docker", "systemctl") if uses_github(args.config) else ("docker", "systemctl"):
         if not shutil.which(tool):
             raise SystemExit(f"ci-flow: {tool} not found")
     if not os.path.exists(args.config):
@@ -127,9 +137,10 @@ def cmd_install(args, system):
         say("Runner slots switch to this version between jobs.")
 
 
-def cmd_init(args, gh):
+def cmd_init(args, gh, gl):
     conf = load_or_new(args.config)
-    steps = machine_init.plan(machine_init.Machine(), conf, gh, args.config, UNIT_DIR, prune_days=args.prune_days)
+    steps = machine_init.plan(machine_init.Machine(), conf, gh, args.config, UNIT_DIR, prune_days=args.prune_days,
+                              gl=gl)
     todo = machine_init.show(steps)
     if not todo:
         say("\nThis machine is set up.")
@@ -165,6 +176,10 @@ def read_profile(entry, gh, info, profile_file=None):
     """The profile to render with, where it came from, and warnings. In order:
     a --profile preview file, the config's inline profile, the repo's file on
     its default branch, the defaults."""
+    if entry["forge"]["kind"] == "gitlab":
+        if profile_file:
+            raise SystemExit(f"ci-flow: {entry['repo']} is a GitLab repo; profiles only apply to GitHub repos")
+        return engine.parse_profile(None)[0], "none (GitLab jobs run in their own images)", []
     if profile_file:
         text = read_text(profile_file)
         if text is None:
@@ -181,28 +196,36 @@ def read_profile(entry, gh, info, profile_file=None):
     return prof, f"{engine.PROFILE_PATH} on {branch}" if text is not None else "defaults (no profile in the repo)", warns
 
 
-def plan_repo(entry, gh, profile_file=None):
-    """Read what GitHub says about the repo and render its project files."""
-    repo = entry["repo"]
+def check_repo(repo, forge, gh, gl):
+    """The repo as its forge reports it, and what the machine owner must know."""
+    if forge["kind"] == "gitlab":
+        info = gl(forge["url"]).repo(repo)
+        return info, gitlab.security_warnings(repo, info)
     info = gh.repo(repo)
-    prof, source, warns = read_profile(entry, gh, info, profile_file)
     fork = gh.fork_settings(repo, not info.get("private")) if info else None
+    return info, engine.security_warnings(repo, info, fork)
+
+
+def plan_repo(entry, gh, profile_file=None, gl=gitlab.GitLab):
+    """Read what the forge says about the repo and render its project files."""
+    info, security = check_repo(entry["repo"], entry["forge"], gh, gl)
+    prof, source, warns = read_profile(entry, gh, info, profile_file)
     return {
         "entry": entry,
         "profile_source": source,
-        "warnings": warns + engine.security_warnings(repo, info, fork),
+        "warnings": warns + security,
         "files": engine.render(entry, prof, source),
     }
 
 
-def apply(conf, gh, system, home=None, profiles=None, out=say):
+def apply(conf, gh, system, home=None, profiles=None, out=say, gl=gitlab.GitLab):
     home = home or engine.HOME
     entries = config.managed(conf)
     profiles = profiles or {}
     for repo in profiles:
         if repo not in {e["repo"] for e in entries}:
             raise SystemExit(f"ci-flow: --profile for {repo}, which is not a managed repo")
-    plans = [plan_repo(e, gh, profiles.get(e["repo"])) for e in entries]
+    plans = [plan_repo(e, gh, profiles.get(e["repo"]), gl) for e in entries]
     if not plans:
         out("No managed repos in the config. Add one with `ci-flow add owner/repo`.")
 
@@ -257,12 +280,20 @@ def apply(conf, gh, system, home=None, profiles=None, out=say):
         out(f"\n{o}: rendered here but not in the config; `ci-flow remove` it, or add its repo back.")
 
 
-def cmd_add(args, gh):
+def cmd_add(args, gh, gl):
     conf = load_or_new(args.config)
     repos = conf.setdefault("repos", [])
     if any(e.get("repo") == args.repo for e in repos):
         raise SystemExit(f"ci-flow: {args.repo} is already in {args.config}")
     entry = {"repo": args.repo, "slots": args.runners}
+    if args.forge == "gitlab":
+        entry["forge"] = "gitlab"
+        if args.gitlab_url:
+            entry["gitlab_url"] = args.gitlab_url
+        if args.image:
+            entry["image"] = args.image
+    elif args.gitlab_url or args.image:
+        raise SystemExit("ci-flow: --gitlab-url and --image are for GitLab repos (--forge gitlab)")
     if args.labels:
         entry["labels"] = [x for x in args.labels.split(",") if x]
     for key in ("memory", "cpus"):
@@ -273,14 +304,17 @@ def cmd_add(args, gh):
         config.managed(conf)
     except config.ConfigError as e:
         raise SystemExit(f"ci-flow: {e}")
-    info = gh.repo(args.repo)
-    for w in engine.security_warnings(args.repo, info, gh.fork_settings(args.repo, not info.get("private"))
-                                      if info else None):
+    for w in check_repo(args.repo, config.forge_of(entry), gh, gl)[1]:
         warn(w)
     config.save(conf, args.config)
     labels = ", ".join(config.BASE_LABELS + entry.get("labels", []))
     print(f"Added {args.repo} with {args.runners} runner(s) ({labels}) to {args.config}.")
-    print("Run `ci-flow apply` to start them; jobs opt in with `runs-on: [self-hosted, ...]`.")
+    if args.forge == "gitlab":
+        print("Run `ci-flow apply` to start them; jobs opt in with `tags: [...]` (any of the labels above).")
+        if not gitlab.token():
+            warn(f"no GITLAB_TOKEN; put one with the create_runner and read_api scopes in {gitlab.ENV_FILE}")
+    else:
+        print("Run `ci-flow apply` to start them; jobs opt in with `runs-on: [self-hosted, ...]`.")
 
 
 def cmd_remove(args, system):
@@ -327,6 +361,8 @@ def profile_drift(e, gh, home=None):
     """Where the profile comes from now, and whether it differs from the one
     the project was last rendered with. The daily image rebuild never rereads
     the profile; only `ci-flow apply` does."""
+    if e["forge"]["kind"] == "gitlab":
+        return read_profile(e, gh, None)[1]
     prof, source, _ = read_profile(e, gh, gh.repo(e["repo"]))
     try:
         with open(os.path.join(engine.project_dir(e["project"], home), "project.json")) as f:
@@ -344,7 +380,8 @@ def cmd_status(args, gh):
     for e in config.managed(conf):
         d = engine.project_dir(e["project"])
         age = loop.image_age(engine.image_of(e["project"]))
-        print(f"{e['repo']}  ({e['project']})")
+        where = f", GitLab {e['forge']['url']}" if e["forge"]["kind"] == "gitlab" else ""
+        print(f"{e['repo']}  ({e['project']}{where})")
         print(f"  files: {d if os.path.isdir(d) else 'not rendered; run ci-flow apply'}")
         print(f"  image: {engine.image_of(e['project'])} "
               f"{'missing' if age is None else f'built {int(age // 3600)}h ago'}")
@@ -378,7 +415,7 @@ def parse_profiles(items):
     return out
 
 
-def main(argv=None, gh=None):
+def main(argv=None, gh=None, gl=None):
     ap = argparse.ArgumentParser(prog="ci-flow", description="Manage the self-hosted runners on this machine.")
     ap.add_argument("--config", default=config.CONFIG, help="config file (default %(default)s)")
     sub = ap.add_subparsers(dest="cmd", required=True, metavar="{init,install,add,remove,apply,status}")
@@ -396,6 +433,9 @@ def main(argv=None, gh=None):
     a.add_argument("--labels", help="extra runner labels, comma-separated")
     a.add_argument("--memory", help='runner memory limit, e.g. "4g"')
     a.add_argument("--cpus", type=float, help="runner CPU limit")
+    a.add_argument("--forge", choices=config.FORGES, default="github", help="where the repo lives (default github)")
+    a.add_argument("--gitlab-url", help="a self-managed GitLab's URL (default https://gitlab.com)")
+    a.add_argument("--image", help=f"GitLab: default image for jobs without one (default {gitlab.DEFAULT_JOB_IMAGE})")
     r = sub.add_parser("remove", help="stop a repo's runners and drop it from the config")
     r.add_argument("repo")
     r.add_argument("--purge", action="store_true", help="also delete its volumes and image")
@@ -409,15 +449,16 @@ def main(argv=None, gh=None):
     lp.add_argument("instance")
     args = ap.parse_args(argv)
     gh = gh or engine.GitHub()
+    gl = gl or gitlab.GitLab
 
     if args.cmd == "runner-loop":
         loop.main(args.instance)
     elif args.cmd == "init":
-        cmd_init(args, gh)
+        cmd_init(args, gh, gl)
     elif args.cmd == "install":
         cmd_install(args, System(args.dry_run))
     elif args.cmd == "add":
-        cmd_add(args, gh)
+        cmd_add(args, gh, gl)
     elif args.cmd == "remove":
         cmd_remove(args, System(args.dry_run))
     elif args.cmd == "status":
@@ -427,4 +468,4 @@ def main(argv=None, gh=None):
             conf = config.load(args.config)
         except config.ConfigError as e:
             raise SystemExit(f"ci-flow: {e}")
-        apply(conf, gh, System(args.dry_run), profiles=parse_profiles(args.profile))
+        apply(conf, gh, System(args.dry_run), profiles=parse_profiles(args.profile), gl=gl)

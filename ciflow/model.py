@@ -158,7 +158,7 @@ def derive(snap):
     if hs["ac"] is False:
         issues.append({"level": "crit", "text": "on battery"})
     if gh_err:
-        issues.append({"level": "warn", "text": f"gh: {', '.join(repo_name(r) for r in gh_err)}"})
+        issues.append({"level": "warn", "text": f"api: {', '.join(repo_name(r) for r in gh_err)}"})
     level = "ok" if not issues else "crit" if any(i["level"] == "crit" for i in issues) else "warn"
 
     # Pipelines: GitHub keeps a run "queued" while some of its jobs already run.
