@@ -4,12 +4,12 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Python stdlib only](https://img.shields.io/badge/python-stdlib%20only-informational.svg)](CONTRIBUTING.md)
 
-Run GitHub Actions on a spare machine and watch it from anywhere.
+Run GitHub Actions and GitLab CI on a spare machine and watch it from anywhere.
 
 That old laptop in a drawer is a decent CI box. ci-flow turns it into
-self-hosted GitHub Actions runners that are isolated and ephemeral, reachable
-only over your [Tailscale](https://tailscale.com) tailnet, with a live
-dashboard in the terminal and the browser. More at
+self-hosted GitHub Actions or GitLab CI runners that are isolated and
+ephemeral, reachable only over your [Tailscale](https://tailscale.com) tailnet,
+with a live dashboard in the terminal and the browser. More at
 [onflow.studio/ci-flow](https://onflow.studio/ci-flow).
 
 ![The ci-flow web dashboard: machine health, runners, running pipelines with their jobs, the queue and recent results](docs/screenshot.png)
@@ -21,7 +21,7 @@ dashboard in the terminal and the browser. More at
 - **Safe by default.** Every job gets a fresh runner container and its own
   Docker daemon, cleaned afterwards. Service ports never collide between
   slots, and nothing leaks into the next job.
-- **Nothing public.** The machine only talks out to GitHub; the dashboard is
+- **Nothing public.** The machine only talks out to GitHub or GitLab; the dashboard is
   shared on your tailnet, not the internet.
 - **You can see it.** Machine health, what every runner is doing, each
   pipeline's jobs live, the queue and recent results, plus push alerts when
@@ -37,7 +37,8 @@ the machine underneath, so switching costs one line per job. Compared with
 Jenkins or a hosted CI there is no server to run and no pipeline language to
 learn; compared with actions-runner-controller there's no Kubernetes; compared
 with plain runner containers you get per-job isolation, cleanup and
-monitoring.
+monitoring. GitLab works the same way: pipelines stay on GitLab, and jobs opt
+in with `tags: [<label>]`.
 
 ## Quick start
 
@@ -52,7 +53,9 @@ ci-flow apply
 tailscale serve --bg --https=7443 http://127.0.0.1:7340   # the dashboard on your tailnet
 ```
 
-Then in the repo's workflows: `runs-on: [self-hosted, ci-box]`. Watch it with
+Then in the repo's workflows: `runs-on: [self-hosted, ci-box]`. For a GitLab
+project, `ci-flow add group/project --forge gitlab ...` and `tags: [ci-box]` in
+`.gitlab-ci.yml` (see [GitLab](docs/runners.md#gitlab)). Watch it with
 `cimon` in a terminal or at `https://<machine>.<tailnet>.ts.net:7443`.
 
 The config reference, repo profiles (extra packages, caches) and the
@@ -168,6 +171,12 @@ per job, registered with a single-use (JIT) config and running under a
 default branch. [docs/runners.md](docs/runners.md) has the config and profile
 reference, the security notes, and how to run the self-test.
 
+GitLab CI works too: `ci-flow add group/project --forge gitlab` (with
+`--gitlab-url` for a self-managed instance), a `GITLAB_TOKEN` in
+`~/.config/ci-flow/env`, and jobs opt in with `tags: [<label>]`. Each job gets
+a fresh single-use runner with the docker executor on the slot's own Docker
+daemon. GitHub stays the default. See [GitLab](docs/runners.md#gitlab).
+
 ## ci-flowd
 
 The collector. It polls the machine (`/proc`, `/sys`), `docker`,
@@ -248,6 +257,7 @@ which would make the dashboard public.
 | `CIFLOW_PORT` | `7340` | ci-flowd |
 | `CIFLOW_URL` | `http://127.0.0.1:7340` | cimon |
 | `CIFLOW_HOME` | `~/.local/share/ci-flow` | ci-flow (installed code in `lib/`, rendered runner projects in `projects/`) |
+| `GITLAB_TOKEN` | read from `~/.config/ci-flow/env` | ci-flow, the runner loop and ci-flowd, for GitLab repos |
 
 ## Tests
 

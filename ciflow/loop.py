@@ -1,9 +1,10 @@
 """The runner loop: keeps one slot of a managed repo online.
 
 Run by the `ci-flow-runner@<project>-<slot>` user unit. Each iteration starts
-the slot's dind daemon, clears what the last job left in it, mints a
-single-use JIT runner config, and runs exactly one job in a fresh runner
-container. On stop it stops the container and deregisters the runner.
+the slot's dind daemon, clears what the last job left in it, registers a
+single-use runner (a JIT config on GitHub, a fresh project runner on GitLab),
+and runs exactly one job in a fresh runner container. On stop it stops the
+container and deregisters the runner.
 
 When `ci-flow install` or `apply` has switched lib/current to a new version,
 the loop exits between jobs and systemd starts it again on the new code, so an
@@ -18,7 +19,7 @@ import subprocess
 import sys
 import time
 
-from . import engine, install
+from . import engine, gitlab, install
 
 HOST = socket.gethostname().split(".")[0]
 IMAGE_MAX_AGE = 86400  # rebuild the runner image at most daily
@@ -59,6 +60,56 @@ def deregister(repo, runner_id, wait=DEREGISTER_FOR, sleep=time.sleep):
         if time.monotonic() >= deadline:
             return False
         sleep(5)
+
+
+class GitHubRunners:
+    """Single-use JIT runners. An ephemeral runner removes itself after its job."""
+    remove_after_job = False
+
+    def __init__(self, repo):
+        self.repo = repo
+
+    def register(self, name, labels):
+        """(handle to deregister with, env for the runner container), or None."""
+        resp = engine.gh_api(f"repos/{self.repo}/actions/runners/generate-jitconfig", method="POST",
+                             body={"name": name, "runner_group_id": 1, "labels": labels, "work_folder": "_work"})
+        if not resp or "encoded_jit_config" not in resp:
+            return None
+        return resp.get("runner", {}).get("id"), {"RUNNER_JITCONFIG": resp["encoded_jit_config"]}
+
+    def deregister(self, handle, wait=DEREGISTER_FOR):
+        return deregister(self.repo, handle, wait)
+
+
+class GitLabRunners:
+    """A project runner per job, deleted with its own token afterwards: GitLab's
+    run-single leaves the runner registered when its one job is done."""
+    remove_after_job = True
+
+    def __init__(self, repo, url):
+        self.repo, self.url = repo, url
+        self.project_id = None
+
+    def register(self, name, labels):
+        if self.project_id is None:
+            info = gitlab.GitLab(self.url).repo(self.repo)
+            if not info:
+                return None
+            self.project_id = info["id"]
+        reg = gitlab.register(self.url, self.repo, self.project_id, name, labels)
+        if not reg:
+            return None
+        return reg["token"], {"CIFLOW_RUNNER_TOKEN": reg["token"], "CIFLOW_RUNNER_NAME": name}
+
+    def deregister(self, handle, wait=0):
+        return gitlab.deregister(self.url, handle)
+
+
+def runners_for(meta):
+    forge = meta.get("forge") or {"kind": "github"}
+    if forge["kind"] == "gitlab":
+        return GitLabRunners(meta["repo"], forge["url"])
+    return GitHubRunners(meta["repo"])
 
 
 def outdated(root=None, home=None):
@@ -116,8 +167,9 @@ class Slot:
         self.project, self.n = parse_instance(instance)
         self.dir = engine.project_dir(self.project, home)
         self.child = None
-        self.runner_id = None
-        self.repo = None
+        self.handle = None  # what deregisters the current runner
+        self.runners = None
+        self.runners_key = None
 
     def log(self, msg):
         log(self.instance, msg)
@@ -152,8 +204,8 @@ class Slot:
                 self.child.kill()
         # An ephemeral runner removes itself after its job; one stopped before
         # or during its job would linger offline.
-        if self.runner_id and self.repo and not deregister(self.repo, self.runner_id):
-            self.log(f"could not deregister runner {self.runner_id}; GitHub drops it when it stays offline")
+        if self.handle and self.runners and not self.runners.deregister(self.handle, DEREGISTER_FOR):
+            self.log("could not deregister the runner; the forge drops it when it stays offline")
         raise SystemExit(0)
 
     def run(self):
@@ -175,7 +227,9 @@ class Slot:
                 self.log("this slot is no longer in the config; idle until the unit is disabled")
                 time.sleep(60)
                 continue
-            self.repo = meta["repo"]
+            key = (meta["repo"], json.dumps(meta.get("forge"), sort_keys=True))
+            if self.runners is None or self.runners_key != key:
+                self.runners, self.runners_key = runners_for(meta), key
             if not build_image(self.project, self.dir, self.log) and image_age(engine.image_of(self.project)) is None:
                 self.log(f"no runner image; retrying in {backoff}s")
                 time.sleep(backoff)
@@ -194,31 +248,29 @@ class Slot:
             # until the id is recorded.
             signal.pthread_sigmask(signal.SIG_BLOCK, STOP_SIGNALS)
             try:
-                resp = engine.gh_api(f"repos/{self.repo}/actions/runners/generate-jitconfig", method="POST",
-                                     body={"name": name, "runner_group_id": 1, "labels": slot["labels"],
-                                           "work_folder": "_work"})
-                if resp and "encoded_jit_config" in resp:
-                    self.runner_id = resp.get("runner", {}).get("id")
+                reg = self.runners.register(name, slot["labels"])
+                if reg:
+                    self.handle = reg[0]
             finally:
                 signal.pthread_sigmask(signal.SIG_UNBLOCK, STOP_SIGNALS)
-            if not resp or "encoded_jit_config" not in resp:
-                self.log(f"could not create a JIT runner config; retrying in {backoff}s")
+            if not reg:
+                self.log(f"could not register a runner; retrying in {backoff}s")
                 time.sleep(backoff)
                 backoff = min(backoff * 2, MAX_BACKOFF)
                 continue
             backoff = 5
             self.log(f"waiting for a job as {name} ({', '.join(slot['labels'])})")
-            env = dict(os.environ, RUNNER_JITCONFIG=resp["encoded_jit_config"])
-            self.child = subprocess.Popen(self.compose("run", "--rm", "--no-deps", "-T", "-e", "RUNNER_JITCONFIG",
-                                                       f"runner-{self.n}"), env=env)
+            env_args = [a for k in reg[1] for a in ("-e", k)]
+            self.child = subprocess.Popen(self.compose("run", "--rm", "--no-deps", "-T", *env_args,
+                                                       f"runner-{self.n}"), env=dict(os.environ, **reg[1]))
             status = self.child.wait()
             self.child = None
             self.log(f"runner exited ({status})")
-            if status and self.runner_id:
-                # A runner that failed before or during its job may still be
-                # registered; one that ran its job has removed itself.
-                deregister(self.repo, self.runner_id, wait=0)
-            self.runner_id = None
+            if self.handle and (status or self.runners.remove_after_job):
+                # A GitHub runner that failed before or during its job may
+                # still be registered; one that ran its job has removed itself.
+                self.runners.deregister(self.handle, wait=0)
+            self.handle = None
             if status:
                 time.sleep(5)
 

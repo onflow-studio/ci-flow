@@ -1,8 +1,9 @@
-"""Collectors for the CI machine: host metrics, runner slots and GitHub runs.
+"""Collectors for the CI machine: host metrics, runner slots and CI runs.
 
 Everything a view needs ends up in one JSON-serialisable snapshot, built by
 Collector.snapshot(). Pure stdlib; data comes from /proc, /sys, docker,
-systemctl --user and gh.
+systemctl --user, gh for GitHub repos and the GitLab API for GitLab ones.
+GitLab pipelines are stored as GitHub-shaped runs, so the views treat both alike.
 """
 import json
 import os
@@ -14,7 +15,7 @@ import threading
 import time
 from collections import deque
 
-from . import config
+from . import config, gitlab
 from .config import ConfigError  # noqa: F401 (re-exported)
 from .model import derive
 
@@ -29,6 +30,11 @@ def load_fleets(path=None):
 
 def repos_of(fleets):
     return list(dict.fromkeys(r for f in fleets for r in f["slots"].values()))
+
+
+def forges_of(fleets):
+    """repo -> its forge, GitHub unless a fleet says otherwise."""
+    return {r: f.get("forge") or {"kind": "github"} for f in fleets for r in f["slots"].values()}
 
 
 def slot_key(project, n):
@@ -169,6 +175,7 @@ class State:
         self.runs = {}         # repo -> list of runs
         self.jobs = {}         # run id -> list of jobs
         self.gh_err = {}       # repo -> error text
+        self.titles = {}       # GitLab commit sha -> title
 
     def set(self, **kw):
         with self.lock:
@@ -242,6 +249,42 @@ def collect_repo(st, repo):
                 st.jobs.pop(r["databaseId"], None)
 
 
+TITLES_KEPT = 500
+
+
+def collect_gitlab(st, repo, url):
+    with st.lock:
+        titles = dict(st.titles)
+    runs = gitlab.runs(url, repo, titles)
+    if runs is None:
+        with st.lock:
+            st.gh_err[repo] = "GitLab API failed"
+        return
+    for r in runs:
+        if r["status"] == "completed":
+            continue
+        jobs = gitlab.jobs(url, repo, r["databaseId"])
+        if jobs is not None:  # else keep the last good jobs for this run
+            with st.lock:
+                st.jobs[r["databaseId"]] = jobs
+    with st.lock:
+        st.runs[repo] = runs
+        st.gh_err.pop(repo, None)
+        st.titles.update(titles)
+        if len(st.titles) > TITLES_KEPT:
+            st.titles = dict(list(st.titles.items())[-TITLES_KEPT:])
+        for r in runs:
+            if r["status"] == "completed":
+                st.jobs.pop(r["databaseId"], None)
+
+
+def collect_any(st, repo, forge):
+    if forge["kind"] == "gitlab":
+        collect_gitlab(st, repo, forge["url"])
+    else:
+        collect_repo(st, repo)
+
+
 def mtime(path):
     try:
         return os.stat(path).st_mtime_ns
@@ -261,6 +304,7 @@ class Collector:
     def __init__(self, fleets, config_path=None, log=None):
         self.fleets = fleets
         self.repos = repos_of(fleets)
+        self.forges = forges_of(fleets)
         self.host = Host()
         self.st = State()
         self.wakers = []
@@ -292,7 +336,7 @@ class Collector:
             return False
         repos = repos_of(fleets)
         with self.st.lock:
-            self.fleets, self.repos = fleets, repos
+            self.fleets, self.repos, self.forges = fleets, repos, forges_of(fleets)
             for gone in set(self.st.runs) - set(repos):
                 self.st.runs.pop(gone, None)
                 self.st.gh_err.pop(gone, None)
@@ -312,7 +356,7 @@ class Collector:
 
         def once():
             if repo in self.repos:
-                collect_repo(self.st, repo)
+                collect_any(self.st, repo, self.forges[repo])
         self.every(15, once)
 
     started = False
@@ -351,7 +395,7 @@ class Collector:
         self.host.sample()
         collect_local(self.st, self.fleets)
         for repo in self.repos:
-            collect_repo(self.st, repo)
+            collect_any(self.st, repo, self.forges[repo])
         self.host.sample()
 
     def refresh(self):

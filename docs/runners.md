@@ -1,7 +1,8 @@
 # Runners
 
 ci-flow runs GitHub Actions jobs on this machine with ephemeral, isolated
-self-hosted runners. You describe what the machine offers in its config, each
+self-hosted runners, and GitLab CI jobs for repos that say `"forge": "gitlab"`
+(see [GitLab](#gitlab)). You describe what the machine offers in its config, each
 repo describes what its jobs need in its profile, and `ci-flow apply` turns
 both into running runner slots.
 
@@ -90,6 +91,9 @@ empty projects directory and the build lock.
 | `slot` | | per-slot overrides of `labels`, `memory`, `cpus`, `node_heap`, `dind_memory`, `dind_cpus`. `labels` here replaces the repo's labels for that slot |
 | `project` | `ciflow-<name>` | compose project name, when two repos share a name; must start with `ciflow-` |
 | `profile` | the repo's file | the repo profile inline, same keys as `.github/ci-flow.toml` (see below); when set, the repo's file is not read |
+| `forge` | `"github"` | `"gitlab"` for a GitLab project (see below) |
+| `gitlab_url` | `https://gitlab.com` | GitLab only: a self-managed instance |
+| `image` | `"ubuntu:24.04"` | GitLab only: the image for jobs that don't name one |
 
 GitHub's queue is the scheduler: a job waits until a slot whose labels it asks
 for is free. To give heavy jobs their own slot, label one slot (`build`
@@ -97,7 +101,61 @@ above) and send those jobs there with `runs-on: [self-hosted, build]`; give
 the others a label the heavy jobs don't use (`general`).
 
 `"fleets"` lists runners ci-flow doesn't manage; the dashboards watch them
-the same way.
+the same way. A fleet on GitLab sets `"forge"` and `"gitlab_url"` like a repo.
+
+## GitLab
+
+A repo is on GitHub unless its entry says otherwise:
+
+```sh
+ci-flow add acme/platform/api --forge gitlab --runners 2 --labels ci-box
+ci-flow add team/app --forge gitlab --gitlab-url https://gitlab.example.com
+```
+
+```json
+{"repo": "acme/platform/api", "forge": "gitlab", "slots": 2, "labels": ["ci-box"], "memory": "6g", "cpus": 4}
+```
+
+ci-flow talks to GitLab's REST API with `GITLAB_TOKEN`, from the environment
+or from `~/.config/ci-flow/env` (`chmod 600` it). A personal, group or project
+access token with the `create_runner` and `read_api` scopes, from someone with
+the Maintainer role on the project, will do. `ci-flow init` checks it is there;
+gh is still installed and used for any GitHub repos.
+
+A GitLab slot has the same `dind-N` daemon, but `runner-N` is
+[gitlab-runner](https://docs.gitlab.com/runner/) with the docker executor:
+
+1. The loop creates a project runner for the slot (`POST /user/runners`)
+   tagged with the slot's labels, `run_untagged` off.
+2. `gitlab-runner run-single --max-builds 1` takes one job and exits. The job
+   and its `services:` run in their own containers on dind-N, from the job's
+   `image:` (or `image` from the config). The runner token stays in the runner
+   container; jobs never see it.
+3. The loop deletes the runner with its own token and starts over, so every
+   job gets a new runner and a cleaned daemon, as on GitHub.
+
+Jobs opt in with tags, any of the slot's labels:
+
+```yaml
+test:
+  tags: [ci-box]
+  image: node:22
+  script: [npm ci, npm test]
+```
+
+What's different from GitHub:
+
+- No profile. Jobs bring their own image, so `profile`, `node_heap`,
+  `dind_memory` and `dind_cpus` are config errors on a GitLab repo. `memory`
+  and `cpus` limit dind-N, where the jobs run.
+- Jobs reach the slot's daemon at `/var/run/docker.sock` (mounted into every
+  job container), so `docker build` and `docker run` work without a
+  `docker:dind` service. It's the slot's daemon, not the host's.
+- GitLab's cache volumes live on dind-N and go with the cleanup between jobs;
+  use `cache:` with a distributed cache, or artifacts, for anything to keep.
+- The dashboards show pipelines as runs and jobs with their runner, but no
+  step progress: GitLab has no steps. Merge request pipelines show as
+  `MR-<n>`.
 
 ## Repo profile
 

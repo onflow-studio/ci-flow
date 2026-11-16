@@ -7,7 +7,9 @@ dashboard in the terminal and the browser. GitHub stays the CI system
 
 ## Scope
 
-- GitHub Actions only.
+- GitHub Actions by default; GitLab CI for repos that say `"forge": "gitlab"`.
+  GitLab pipelines are mapped onto the same run and job shapes in the
+  collector, so the dashboards don't know which forge a run came from.
 - One machine for now; several machines are next (see the roadmap).
 - Open source. Users install it on their own machine.
 

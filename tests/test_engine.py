@@ -63,9 +63,10 @@ class Config(unittest.TestCase):
         conf = {"fleets": [{"project": "old-ci", "unit": "old@{}.service", "slots": {"1": "acme/api"}}],
                 "repos": [{"repo": "acme/web", "slots": 2}]}
         fl = config.fleets(conf)
-        self.assertEqual(fl[0], {"project": "old-ci", "unit": "old@{}.service", "slots": {1: "acme/api"}})
+        self.assertEqual(fl[0], {"project": "old-ci", "unit": "old@{}.service", "forge": {"kind": "github"},
+                                 "slots": {1: "acme/api"}})
         self.assertEqual(fl[1], {"project": "ciflow-web", "unit": "ci-flow-runner@ciflow-web-{}.service",
-                                 "slots": {1: "acme/web", 2: "acme/web"}})
+                                 "forge": {"kind": "github"}, "slots": {1: "acme/web", 2: "acme/web"}})
 
     def test_rejects_bad_entries(self):
         bad = [
@@ -96,7 +97,8 @@ class Config(unittest.TestCase):
             path = os.path.join(d, "config.json")
             with open(path, "w") as f:
                 json.dump({"fleets": [{"project": "p", "unit": "u@{}.service", "slots": {"1": "a/b"}}]}, f)
-            self.assertEqual(collect.load_fleets(path), [{"project": "p", "unit": "u@{}.service", "slots": {1: "a/b"}}])
+            self.assertEqual(collect.load_fleets(path), [{"project": "p", "unit": "u@{}.service",
+                                                          "forge": {"kind": "github"}, "slots": {1: "a/b"}}])
             with open(path, "w") as f:
                 json.dump({"other": 1}, f)
             with self.assertRaises(config.ConfigError):
